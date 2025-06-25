@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+
+# Directories for torrents and output
+__torrent__/
+cleaned_torrents/
+malicious_torrents/
+delete_exe/
+
+# JSON output files
+peers.json
+peers_cleaned.json
+results.json
+
+# VSCode settings (if you use VSCode)
+.vscode/
+
+# MongoDB local data (if you have any local dump folders)
+dump/
+
+# Logs
+*.log
