@@ -11,10 +11,14 @@ from dotenv import load_dotenv
 from torrentool.api import Torrent
 from pymongo import MongoClient
 
+
 # === Load environment ===
 load_dotenv()
 VT_API_KEY = os.getenv("VT_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
+QBIT_WEBUI_URL = os.getenv("Qbit_Web_Ui_URI")
+QBIT_USERNAME = os.getenv("QBIT_USERNAME")
+QBIT_PASSWORD = os.getenv("QBIT_PASSWORD")
 
 # === MongoDB setup ===
 client = MongoClient(MONGO_URI)
@@ -23,22 +27,22 @@ blocklist_domains_col = db["blocked_domains"]
 blocklist_ips_col = db["blocked_ips"]
 scanned_exes_col = db["scanned_exes"]
 
-# === Paths ===
+# === Paths and files ===
 TORRENT_DIR = "__torrent__"
 CLEAN_DIR = "cleaned_torrents"
 MALICIOUS_DIR = "malicious_torrents"
-PEER_FILE = "peers.json"
-CLEAN_PEER_FILE = "peers_cleaned.json"
 RESULT_FILE = "results.json"
 EXE_DIR = "exes"
 DELETE_EXE_DIR = "delete_exe"
+PEERS_JSON = "peers.json"
+DANGER_PEERS_JSON = "danger_peers.json"
 
+# === Global sets ===
 URL_RESULTS = []
 KNOWN_BAD_DOMAINS = set()
 KNOWN_BAD_IPS = set()
 
-# === Helpers ===
-
+# === Load blocked domains and IPs from MongoDB ===
 def load_blocklist_domains():
     docs = blocklist_domains_col.find({})
     return set(doc["domain"] for doc in docs)
@@ -47,6 +51,7 @@ def load_blocklist_ips():
     docs = blocklist_ips_col.find({})
     return set(doc["ip"] for doc in docs)
 
+# === Append new blocked domain/ip to MongoDB and update sets ===
 def append_to_blocklist_domain(domain):
     if domain and domain not in KNOWN_BAD_DOMAINS:
         blocklist_domains_col.insert_one({
@@ -65,6 +70,7 @@ def append_to_blocklist_ip(ip):
         KNOWN_BAD_IPS.add(ip)
         print(f"🛑 Blocked IP saved in DB: {ip}")
 
+# === Check if domain/ip is known bad ===
 def is_known_bad_domain(url: str) -> bool:
     try:
         domain = urlparse(url).hostname
@@ -75,6 +81,7 @@ def is_known_bad_domain(url: str) -> bool:
 def is_known_bad_ip(ip: str) -> bool:
     return ip in KNOWN_BAD_IPS
 
+# === Record tracker check results ===
 def record_result(url, status, file, safe):
     URL_RESULTS.append({
         "url": url,
@@ -83,6 +90,7 @@ def record_result(url, status, file, safe):
         "safe": safe
     })
 
+# === Resolve UDP trackers ===
 async def resolve_udp(url):
     try:
         domain = urlparse(url).hostname
@@ -93,6 +101,7 @@ async def resolve_udp(url):
     except Exception as e:
         return f"udp_error:{type(e).__name__}"
 
+# === Check tracker URL status ===
 async def check_tracker(session, url):
     if url.startswith("udp://"):
         return await resolve_udp(url)
@@ -115,6 +124,7 @@ async def check_tracker(session, url):
     except Exception as e:
         return f"error:{str(e).split(':')[0]}"
 
+# === VirusTotal IP check ===
 async def check_ip_vt(ip, session):
     if not VT_API_KEY:
         return {"ip": ip, "malicious": 0, "suspicious": 0}
@@ -130,7 +140,7 @@ async def check_ip_vt(ip, session):
     except Exception as e:
         return {"ip": ip, "error": str(e)}
 
-# === Torrent Cleaning ===
+# === Torrent cleaning ===
 async def clean_torrent(file_path, filename, session):
     try:
         torrent = Torrent.from_file(file_path)
@@ -179,49 +189,68 @@ async def clean_torrent(file_path, filename, session):
     except Exception as e:
         print(f"[!] Error: {e}")
 
-# === Peer Checker ===
-async def peer_check():
-    if not os.path.exists(PEER_FILE):
-        print(f"[!] {PEER_FILE} missing")
+# === Peer JSON → VirusTotal → danger_peers.json → MongoDB update pipeline ===
+async def scan_peers_json():
+    if not os.path.exists(PEERS_JSON):
+        print(f"[!] {PEERS_JSON} missing, skipping peer scan")
         return
 
-    with open(PEER_FILE, "r") as f:
-        try:
-            peers = json.load(f)
-        except Exception:
-            print(f"[!] Failed to load peers from {PEER_FILE}")
-            return
+    with open(PEERS_JSON, "r") as f:
+        peers = json.load(f)
 
-    if not isinstance(peers, list):
-        print(f"[!] {PEER_FILE} is not a list")
-        return
+    danger_peers = []
 
-    clean_peers = []
     async with aiohttp.ClientSession() as session:
-        for i, ip in enumerate(peers, start=1):
+        for ip in peers:
             if is_known_bad_ip(ip):
-                print(f"🛑 Peer {ip} is in manual IP blocklist")
-                continue  # skip VT check, already blocked
+                print(f"🛑 {ip} already blocked, skipping VT check")
+                continue
 
-            print(f"👁️ Peer {ip}", end=" ")
+            print(f"Checking VT for peer {ip} ...", end=" ")
             result = await check_ip_vt(ip, session)
             if "error" in result:
                 print(f"⚠️ {result['error']}")
-            elif result["malicious"] > 0 or result["suspicious"] > 1:
-                print(f"🛑 {result}")
+                continue
+
+            if result["malicious"] > 0 or result["suspicious"] > 1:
+                print("🛑 Malicious/Suspicious!")
+                danger_peers.append(ip)
                 append_to_blocklist_ip(ip)
             else:
-                print("✅")
-                clean_peers.append(ip)
+                print("✅ Clean")
 
-            # Rate limit delay: 4 requests then 60 sec, else 15 sec
+            await asyncio.sleep(15)  # rate limit
+
+    # Save dangerous peers to danger_peers.json
+    with open(DANGER_PEERS_JSON, "w") as f:
+        json.dump(danger_peers, f, indent=4)
+    print(f"📝 Saved danger peers to {DANGER_PEERS_JSON}")
+
+# === Peer MongoDB → VirusTotal → update blocklist pipeline ===
+async def peer_check():
+    ips = list(KNOWN_BAD_IPS)
+    if not ips:
+        print("[!] No blocked IPs found in MongoDB for peer_check")
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for i, ip in enumerate(ips, start=1):
+            print(f"Rechecking blocked IP {ip} ...", end=" ")
+            result = await check_ip_vt(ip, session)
+            if "error" in result:
+                print(f"⚠️ {result['error']}")
+                continue
+
+            if result["malicious"] == 0 and result["suspicious"] <= 1:
+                print("✅ Cleaned or false positive? Remove from blocklist.")
+                blocklist_ips_col.delete_one({"ip": ip})
+                KNOWN_BAD_IPS.discard(ip)
+            else:
+                print("🛑 Still bad.")
+
             await asyncio.sleep(15 if i % 4 else 60)
 
-    with open(CLEAN_PEER_FILE, "w") as f:
-        json.dump(clean_peers, f, indent=2)
-    print(f"✔️ Saved cleaned peers to {CLEAN_PEER_FILE}")
-
-# === EXE Scanner ===
+# === EXE scanner ===
 async def scan_exes():
     os.makedirs(DELETE_EXE_DIR, exist_ok=True)
 
@@ -236,14 +265,12 @@ async def scan_exes():
 
             full_path = os.path.join(EXE_DIR, exe_file)
 
-            # Calculate SHA256 hash
             hash_sha256 = hashlib.sha256()
             with open(full_path, "rb") as f:
                 for chunk in iter(lambda: f.read(8192), b""):
                     hash_sha256.update(chunk)
             file_hash = hash_sha256.hexdigest()
 
-            # Check VT for the file hash
             vt_url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
             headers = {"x-apikey": VT_API_KEY}
 
@@ -255,7 +282,6 @@ async def scan_exes():
                         malicious = stats.get("malicious", 0)
                         suspicious = stats.get("suspicious", 0)
                     elif resp.status == 404:
-                        # File hash not found in VT
                         malicious = 0
                         suspicious = 0
                     else:
@@ -267,7 +293,6 @@ async def scan_exes():
                 malicious = 0
                 suspicious = 0
 
-            # Log and save result in MongoDB
             scanned_exes_col.insert_one({
                 "filename": exe_file,
                 "sha256": file_hash,
@@ -278,14 +303,40 @@ async def scan_exes():
 
             print(f"🔍 EXE {exe_file} — Malicious: {malicious}, Suspicious: {suspicious}")
 
-            # Move malicious or suspicious exe to delete_exe folder
             if malicious > 0 or suspicious > 0:
                 dest = os.path.join(DELETE_EXE_DIR, exe_file)
                 shutil.move(full_path, dest)
                 print(f"🗑️ Moved {exe_file} to {DELETE_EXE_DIR}")
 
-# === Main Scan ===
-async def main():
+# === qBittorrent Web UI Login ===
+async def qbit_login(session, retries=5, delay=5):
+    login_url = f"{QBIT_WEBUI_URL.rstrip('/')}/api/v2/auth/login"
+    data = {
+        "username": QBIT_USERNAME,
+        "password": QBIT_PASSWORD
+    }
+    
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.post(login_url, data=data) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    if "Ok." in text:
+                        print("✅ Logged into qBittorrent Web UI")
+                        return True
+                print(f"❌ Failed to login (HTTP {resp.status}) attempt {attempt}/{retries}")
+        except aiohttp.ClientConnectorError as e:
+            print(f"⚠️ Connection error on attempt {attempt}/{retries}: {e}")
+        except Exception as e:
+            print(f"⚠️ Unexpected error on attempt {attempt}/{retries}: {e}")
+        
+        if attempt < retries:
+            await asyncio.sleep(delay)
+    print("❌ All login attempts failed.")
+    return False
+
+# === Torrent cleaning main ===
+async def clean_all_torrents():
     global KNOWN_BAD_DOMAINS, KNOWN_BAD_IPS
     KNOWN_BAD_DOMAINS = load_blocklist_domains()
     KNOWN_BAD_IPS = load_blocklist_ips()
@@ -309,11 +360,27 @@ async def main():
         json.dump(URL_RESULTS, f, indent=4)
     print(f"📜 Saved results to {RESULT_FILE}")
 
-# === Entry Point ===
+# === Full run with both pipelines ===
 async def full_run():
-    await main()
+    # Load current blocklists
+    global KNOWN_BAD_DOMAINS, KNOWN_BAD_IPS
+    KNOWN_BAD_DOMAINS = load_blocklist_domains()
+    KNOWN_BAD_IPS = load_blocklist_ips()
+
+    # 1) Clean torrents
+    await clean_all_torrents()
+
+    # 2) Peer JSON → VT → danger_peers.json → MongoDB update
+    await scan_peers_json()
+
+    # 3) MongoDB peer re-check cleanup
     await peer_check()
+
+    # 4) EXE scanner
     await scan_exes()
+
+    # 5) Sync blocked IPs MongoDB → qBittorrent (with fresh load)
+    await sync_blocked_ips_to_qbit()
 
 if __name__ == "__main__":
     asyncio.run(full_run())
