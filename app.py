@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from torrentool.api import Torrent
 from pymongo import MongoClient
 
-
 # === Load environment ===
 load_dotenv()
 VT_API_KEY = os.getenv("VT_API_KEY")
@@ -335,6 +334,51 @@ async def qbit_login(session, retries=5, delay=5):
     print("❌ All login attempts failed.")
     return False
 
+# === Sync blocked IPs to qBittorrent IP filter ===
+async def sync_blocked_ips_to_qbit():
+    if not QBIT_WEBUI_URL or not QBIT_USERNAME or not QBIT_PASSWORD:
+        print("❌ qBittorrent credentials or URL missing, skipping IP sync")
+        return
+
+    async with aiohttp.ClientSession() as session:
+        if not await qbit_login(session):
+            print("❌ Could not login to qBittorrent, skipping IP sync")
+            return
+
+        # Get current IP filter rules
+        ip_filter_url = f"{QBIT_WEBUI_URL.rstrip('/')}/api/v2/ip_filter/rules"
+        try:
+            async with session.get(ip_filter_url) as resp:
+                if resp.status == 200:
+                    existing_rules = await resp.json()
+                else:
+                    print(f"❌ Failed to get existing IP filter rules, HTTP {resp.status}")
+                    existing_rules = []
+        except Exception as e:
+            print(f"❌ Exception while getting IP filter rules: {e}")
+            existing_rules = []
+
+        existing_ips = {rule.get("ip") for rule in existing_rules if rule.get("ip")}
+        
+        new_ips = KNOWN_BAD_IPS - existing_ips
+        print(f"ℹ️ Syncing {len(new_ips)} new IPs to qBittorrent IP filter")
+
+        for ip in new_ips:
+            add_rule_url = f"{QBIT_WEBUI_URL.rstrip('/')}/api/v2/ip_filter/add_rule"
+            params = {
+                "ip": ip,
+                "type": 1,  # 1 = block
+                "comment": "Blocked by torrent_cleaner"
+            }
+            try:
+                async with session.post(add_rule_url, params=params) as resp:
+                    if resp.status == 200:
+                        print(f"➕ Added IP filter rule: {ip}")
+                    else:
+                        print(f"❌ Failed to add IP filter rule for {ip}, HTTP {resp.status}")
+            except Exception as e:
+                print(f"❌ Exception adding IP filter rule for {ip}: {e}")
+
 # === Torrent cleaning main ===
 async def clean_all_torrents():
     global KNOWN_BAD_DOMAINS, KNOWN_BAD_IPS
@@ -362,24 +406,14 @@ async def clean_all_torrents():
 
 # === Full run with both pipelines ===
 async def full_run():
-    # Load current blocklists
     global KNOWN_BAD_DOMAINS, KNOWN_BAD_IPS
     KNOWN_BAD_DOMAINS = load_blocklist_domains()
     KNOWN_BAD_IPS = load_blocklist_ips()
 
-    # 1) Clean torrents
     await clean_all_torrents()
-
-    # 2) Peer JSON → VT → danger_peers.json → MongoDB update
     await scan_peers_json()
-
-    # 3) MongoDB peer re-check cleanup
     await peer_check()
-
-    # 4) EXE scanner
     await scan_exes()
-
-    # 5) Sync blocked IPs MongoDB → qBittorrent (with fresh load)
     await sync_blocked_ips_to_qbit()
 
 if __name__ == "__main__":
